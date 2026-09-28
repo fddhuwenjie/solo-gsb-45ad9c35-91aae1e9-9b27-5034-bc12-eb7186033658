@@ -1,0 +1,13 @@
+services:
+  basin:
+    build: .
+    image: storm-basin:latest
+    container_name: storm-basin
+    ports:
+      - "8000:8000"
+    volumes:
+      - basin-data:/data
+    restart: unless-stopped
+
+volumes:
+  basin-data:

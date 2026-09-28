@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>城市雨洪调蓄池泄放序列推演台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">≈</span>
+    <div>
+      <h1>城市雨洪调蓄池泄放序列推演台</h1>
+      <p>按时段搜索闸门开度序列 · 先避免库容溢流，再最小化下游超标总量</p>
+    </div>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- ============ 左：参数 ============ -->
+  <section class="panel params-panel">
+    <h2>方案参数</h2>
+
+    <div class="field-grid">
+      <label>方案名称
+        <input id="f-name" type="text" value="未命名方案">
+      </label>
+      <label>时间步长 (分钟)
+        <input id="f-dt-min" type="number" min="1" step="1" value="60">
+      </label>
+      <label>调蓄池容量 (m³)
+        <input id="f-capacity" type="number" min="1" step="100" value="80000">
+      </label>
+      <label>初始库容 (m³)
+        <input id="f-v0" type="number" min="0" step="100" value="2000">
+      </label>
+      <label>下游安全流量上限 (m³/s)
+        <input id="f-qsafe" type="number" min="0" step="0.1" value="12">
+      </label>
+      <label>切换最小间隔 (个时段)
+        <input id="f-min-int" type="number" min="1" step="1" value="2">
+      </label>
+      <label>预报开始时闸门档位（1 基）
+        <input id="f-init-gear" type="number" min="1" step="1" value="1">
+      </label>
+      <label>现状档已保持 (个时段)
+        <input id="f-init-held" type="number" min="0" step="1" value="0">
+      </label>
+    </div>
+    <p class="hint">说明：「已保持」为 0 表示现状档刚切换到位，须等满最小间隔后才能再次换档；
+       填入不小于最小间隔的数值表示当前可立即切换。</p>
+
+    <div class="sub-block">
+      <div class="sub-head">
+        <h3>闸门开度档位（过流能力 m³/s）</h3>
+        <div class="mini-btns">
+          <button type="button" id="btn-add-gear" class="btn-mini">＋ 加一档</button>
+        </div>
+      </div>
+      <div id="gears" class="chip-inputs"></div>
+    </div>
+
+    <div class="sub-block">
+      <div class="sub-head">
+        <h3>分时段入流预测（m³/s，按时序）</h3>
+        <div class="mini-btns">
+          <button type="button" id="btn-add-inflow" class="btn-mini">＋ 加一时段</button>
+          <button type="button" id="btn-del-inflow" class="btn-mini btn-danger-mini">－ 删末段</button>
+        </div>
+      </div>
+      <div id="inflows" class="cell-inputs"></div>
+    </div>
+
+    <div class="actions">
+      <button id="btn-solve" class="btn btn-primary">▶ 立即推演</button>
+      <button id="btn-save" class="btn">保存场景</button>
+      <button id="btn-update" class="btn" hidden>更新当前场景</button>
+      <button id="btn-reset" class="btn btn-ghost">载入示例</button>
+    </div>
+    <p id="form-error" class="form-error" hidden></p>
+
+    <div class="sub-block saved-block">
+      <h3>已保存场景 / 历史推演</h3>
+      <ul id="scenario-list" class="scenario-list"></ul>
+    </div>
+  </section>
+
+  <!-- ============ 右：结果 ============ -->
+  <section class="panel result-panel">
+    <div id="placeholder" class="placeholder">
+      <div class="ph-icon">⌁</div>
+      <p>在左侧录入参数，点击「立即推演」查看闸门开度序列、库容与出流过程。</p>
+    </div>
+
+    <div id="result" hidden>
+      <div id="verdict"></div>
+      <div id="chips" class="chips"></div>
+      <div id="charts"></div>
+      <div id="table-wrap"></div>
+      <div id="infeasible"></div>
+      <details id="engine-detail" class="engine-detail">
+        <summary>搜索过程统计</summary>
+        <pre id="engine-stats"></pre>
+      </details>
+    </div>
+  </section>
+</main>
+
+<footer class="footer">
+  水量平衡 V(t+1)=V(t)+I(t)−R(t) ｜ 硬约束：库容不超限、档位切换最小间隔 ｜ 优化目标：不溢流 → 超标总量 → 切换次数 → 峰值
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
