@@ -126,5 +126,104 @@ assert client.get("/api/scenarios/99999").status_code == 404
 client.delete(f"/api/scenarios/{sid}")
 assert client.get(f"/api/runs/{run['run_id']}").status_code == 404
 
+# ---------------- 容量反算（POST /api/size-capacity） ----------------
+SIZE_PARAMS = dict(
+    name="容量反算", capacity_upper_m3=120000, exceed_budget_m3=0,
+    initial_storage_m3=2000, dt_s=3600, q_safe=12, min_interval=2,
+    initial_opening_index=1, initial_held=0,
+    openings=[0, 3, 6, 9, 12, 16],
+    inflows=[2, 5, 12, 20, 18, 12, 7, 4, 2, 1, 0, 0],
+)
+
+# 基本反算：最小容量、夹逼区间、见证序列
+rs = client.post("/api/size-capacity", json=SIZE_PARAMS).json()
+assert rs["feasible"], rs
+assert rs["kind"] == "capacity_sizing"
+cap_star = rs["min_capacity_m3"]
+ss = rs["search"]
+assert ss["proven_feasible_at_m3"] == cap_star
+assert abs(ss["proven_infeasible_below_m3"] - (cap_star - ss["quantum_m3"])) < 1e-12
+assert ss["interval_width_m3"] == ss["quantum_m3"] == 1.0
+assert ss["exact"] is True and ss["monotonic"] is True
+assert len(ss["trials"]) == ss["iterations"] + 1      # 上界检验 + 每轮二分各一次
+ws = rs["witness"]
+assert ws["params"]["capacity_m3"] == cap_star
+assert len(ws["steps"]) == 12
+assert ws["summary"]["total_exceed_m3"] <= SIZE_PARAMS["exceed_budget_m3"]
+assert ws["summary"]["max_storage_m3"] <= cap_star
+# 见证序列水量平衡复核
+_v = SIZE_PARAMS["initial_storage_m3"]
+for _st in ws["steps"]:
+    assert abs(_st["storage_start_m3"] - _v) < 1e-6
+    _v = _v + _st["inflow_m3"] - _st["release_m3"]
+    assert abs(_st["storage_end_m3"] - _v) < 1e-6
+    assert _v <= cap_star + 1e-9
+# 与 /api/solve 交叉验证：最小容量处可行且达标；低 1 个量子处不可行或不达标
+r_hi = client.post("/api/solve", json=dict(DEMO_PARAMS, capacity_m3=cap_star)).json()
+assert r_hi["feasible"] and r_hi["objective"]["total_exceed_m3"] <= 0
+r_lo = client.post("/api/solve", json=dict(DEMO_PARAMS, capacity_m3=cap_star - 1)).json()
+assert (not r_lo["feasible"]) or r_lo["objective"]["total_exceed_m3"] > 0
+
+# 上界不可行：预算过紧（BUDGET_UNATTAINABLE）
+rs2 = client.post("/api/size-capacity",
+                  json=dict(SIZE_PARAMS, q_safe=0, exceed_budget_m3=0)).json()
+assert not rs2["feasible"] and rs2["infeasible"]["code"] == "BUDGET_UNATTAINABLE"
+assert rs2["infeasible"]["min_exceed_at_upper_m3"] > 0
+assert any("预算" in s or "上界" in s for s in rs2["infeasible"]["suggestions"])
+# 上界不可行：物理溢流（OVERFLOW_UNAVOIDABLE，带满管轨迹）
+rs3 = client.post("/api/size-capacity",
+                  json=dict(SIZE_PARAMS, capacity_upper_m3=5000,
+                            exceed_budget_m3=10**9)).json()
+assert not rs3["feasible"] and rs3["infeasible"]["code"] == "OVERFLOW_UNAVOIDABLE"
+assert len(rs3["infeasible"]["greedy_trajectory"]) == 12
+# 上界不可行：初始库容超上界（ALREADY_OVERFLOW）
+rs4 = client.post("/api/size-capacity",
+                  json=dict(SIZE_PARAMS, capacity_upper_m3=1000)).json()
+assert not rs4["feasible"] and rs4["infeasible"]["code"] == "ALREADY_OVERFLOW"
+# 上界不可行：切换锁定（LOCKED_INTERVAL）
+rs5 = client.post("/api/size-capacity",
+                  json=dict(SIZE_PARAMS, capacity_upper_m3=80000,
+                            min_interval=3, exceed_budget_m3=10**9)).json()
+assert not rs5["feasible"] and rs5["infeasible"]["code"] == "LOCKED_INTERVAL"
+assert rs5["infeasible"]["at_step"] is not None
+
+# 任一试算触发 SEARCH_LIMIT -> 整个请求规模拒绝（不得返回不可行/近似结果）
+_old_limit2 = engine.DEFAULT_MAX_STATES
+engine.DEFAULT_MAX_STATES = 5
+try:
+    rs6 = client.post("/api/size-capacity", json=SIZE_PARAMS).json()
+finally:
+    engine.DEFAULT_MAX_STATES = _old_limit2
+assert not rs6["feasible"] and rs6["infeasible"]["code"] == "SEARCH_LIMIT"
+assert "min_capacity_m3" not in rs6 and "witness" not in rs6
+# 恢复后反算正常
+rs7 = client.post("/api/size-capacity", json=SIZE_PARAMS).json()
+assert rs7["feasible"] and rs7["search"]["exact"] is True
+
+# 参数校验：负预算 / 非正上界 / 初始档越界 -> 422
+assert client.post("/api/size-capacity",
+                   json=dict(SIZE_PARAMS, exceed_budget_m3=-1)).status_code == 422
+assert client.post("/api/size-capacity",
+                   json=dict(SIZE_PARAMS, capacity_upper_m3=0)).status_code == 422
+assert client.post("/api/size-capacity",
+                   json=dict(SIZE_PARAMS, initial_opening_index=99)).status_code == 422
+
+# 高精度反算：量子级精确的最小容量与夹逼下界
+rsp = client.post("/api/size-capacity", json=dict(
+    name="高精度反算", capacity_upper_m3=99999.99998, exceed_budget_m3=0.00006,
+    initial_storage_m3=99999.99994, dt_s=60, q_safe=0, min_interval=1,
+    initial_opening_index=1, initial_held=1,
+    openings=[0, 0.000001], inflows=[0.000001])).json()
+assert rsp["feasible"], rsp
+assert rsp["min_capacity_m3"] == 99999.99994
+assert rsp["search"]["quantum_m3"] == 1e-05
+assert rsp["search"]["proven_infeasible_below_m3"] == 99999.99993
+assert rsp["witness"]["summary"]["total_exceed_m3"] == 0.00006
+# 预算差 1 个量子 -> BUDGET_UNATTAINABLE
+rsp2 = client.post("/api/size-capacity",
+                   json=dict(rsp["params"], exceed_budget_m3=0.00005)).json()
+assert not rsp2["feasible"] and rsp2["infeasible"]["code"] == "BUDGET_UNATTAINABLE"
+assert rsp2["infeasible"]["min_exceed_at_upper_m3"] == 0.00006
+
 os.remove(_db)
 print("ALL API E2E TESTS PASSED")

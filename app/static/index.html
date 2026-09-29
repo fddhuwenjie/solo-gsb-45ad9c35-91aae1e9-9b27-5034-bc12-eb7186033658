@@ -72,6 +72,26 @@
       <div id="inflows" class="cell-inputs"></div>
     </div>
 
+    <div class="sub-block sizing-block">
+      <div class="sub-head">
+        <h3>容量反算（容量规划）</h3>
+      </div>
+      <div class="field-grid">
+        <label>允许的下游超标总量 (m³)
+          <input id="f-budget" type="number" min="0" step="100" value="0">
+        </label>
+        <label>设计容量上界 (m³)
+          <input id="f-cap-upper" type="number" min="1" step="1000" value="120000">
+        </label>
+      </div>
+      <p class="hint">沿用上方入流、闸门档位、切换间隔与初始状态（「调蓄池容量」不参与反算），
+        在接口输入的共同十进制量子上精确二分：求出满足超标预算且全程不溢流的最小设计库容，
+        并给出已证实的不可行下界与可行上界。</p>
+      <div class="actions">
+        <button id="btn-size" class="btn btn-primary">▶ 反算最小设计库容</button>
+      </div>
+    </div>
+
     <div class="actions">
       <button id="btn-solve" class="btn btn-primary">▶ 立即推演</button>
       <button id="btn-save" class="btn">保存场景</button>
@@ -90,12 +110,14 @@
   <section class="panel result-panel">
     <div id="placeholder" class="placeholder">
       <div class="ph-icon">⌁</div>
-      <p>在左侧录入参数，点击「立即推演」查看闸门开度序列、库容与出流过程。</p>
+      <p>在左侧录入参数，点击「立即推演」查看闸门开度序列、库容与出流过程；<br>
+      或填写超标预算与容量上界，点击「反算最小设计库容」进行容量规划。</p>
     </div>
 
     <div id="result" hidden>
       <div id="verdict"></div>
       <div id="chips" class="chips"></div>
+      <div id="sizing-block"></div>
       <div id="charts"></div>
       <div id="table-wrap"></div>
       <div id="infeasible"></div>
@@ -108,7 +130,7 @@
 </main>
 
 <footer class="footer">
-  水量平衡 V(t+1)=V(t)+I(t)−R(t) ｜ 硬约束：库容不超限、档位切换最小间隔 ｜ 优化目标：不溢流 → 超标总量 → 切换次数 → 峰值
+  水量平衡 V(t+1)=V(t)+I(t)−R(t) ｜ 硬约束：库容不超限、档位切换最小间隔 ｜ 优化目标：不溢流 → 超标总量 → 切换次数 → 峰值 ｜ 容量反算：超标预算下最小设计库容（单调可行性 · 量子级精确二分）
 </footer>
 
 <script src="/static/app.js"></script>
