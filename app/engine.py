@@ -31,6 +31,14 @@
 DEFAULT_MAX_* 上限时抛出 SearchLimitExceeded，由 solve() 转为可识别的
 "规模拒绝"（code=SEARCH_LIMIT），绝不把近似值标成最优。
 
+容量反算（size_capacity，给方案设计人员用）：沿用上述全部入力，只把
+"容量"换成待求量 —— 给定超标预算 B 与设计容量上界 U，在初始库容/上界/
+预算/各单时段水量共同确定的十进制量子网格 [V0, U] 上，二分求
+"全程不溢流且 e*(C)≤B"的最小容量 C*（可行性谓词关于 C 单调，见
+size_capacity 段注释的证明）；C* 上的见证序列就是同一套 DP 的字典序
+最优解。任一试算触及 SearchLimitExceeded 都意味着该容量真值未知，
+整请求直接规模拒绝——未完成试算绝不允许被当作不可行去收缩区间。
+
 单位：流量 m³/s，库容/超标水量 m³，步长 dt 秒；引擎内部一律为整数量子。
 """
 from __future__ import annotations
@@ -83,15 +91,18 @@ def _frac_digits(d: Decimal) -> int:
     return -exp if exp < 0 else 0
 
 
-def _to_int_quantum(capacity, v0, dt_s, q_safe, openings, inflows):
+def _to_int_quantum(capacity, v0, dt_s, q_safe, openings, inflows,
+                    extra_m3: Optional[list] = None):
     """全部浮点参数 → 统一十进制量子下的精确整数表示。
 
     量子 = 10^-D m³，D 取 容量 / 初始库容 / 各单时段水量（流量×步长，含安全
-    流量）的最大小数位。所有输入都是有限十进制，故换算后每个量都是精确整数：
+    流量）（以及容量反算时追加的 m³ 量：容量上界、超标预算）的最大小数位。
+    所有输入都是有限十进制，故换算后每个量都是精确整数：
     归并键就是精确库容本身，容量判定是严格整数比较，不存在任何舍入窗口。
 
-    返回 (scale, cap_q, v0_q, qsafe_step_q, openings_step_q, inflows_step_q)，
-    物理量(m³) = 整数量 / scale。
+    返回 (scale, cap_q, v0_q, qsafe_step_q, openings_step_q, inflows_step_q,
+          extras_q)，物理量(m³) = 整数量 / scale；extras_q 为 extra_m3 中
+    各量在同一量子下的精确整数（默认空表，保持旧调用的 6 元组语义）。
     """
     dt_d = _dec(dt_s)
     cap_d = _dec(capacity)
@@ -99,8 +110,9 @@ def _to_int_quantum(capacity, v0, dt_s, q_safe, openings, inflows):
     qs_step_d = _dec(q_safe) * dt_d
     o_step_d = [_dec(o) * dt_d for o in openings]
     i_step_d = [_dec(i) * dt_d for i in inflows]
+    extra_d = [_dec(x) for x in (extra_m3 or [])]
     digits = 0
-    for d in (cap_d, v0_d, qs_step_d, *o_step_d, *i_step_d):
+    for d in (cap_d, v0_d, qs_step_d, *o_step_d, *i_step_d, *extra_d):
         fd = _frac_digits(d)
         if fd > digits:
             digits = fd
@@ -110,7 +122,8 @@ def _to_int_quantum(capacity, v0, dt_s, q_safe, openings, inflows):
         return int(d * scale)          # d 的小数位 ≤ D，乘积必为整数，转换精确
 
     return (scale, q(cap_d), q(v0_d), q(qs_step_d),
-            [q(x) for x in o_step_d], [q(x) for x in i_step_d])
+            [q(x) for x in o_step_d], [q(x) for x in i_step_d],
+            [q(x) for x in extra_d])
 
 
 def _qfmt(q: int, scale: int) -> str:
@@ -452,7 +465,7 @@ def solve(params: dict) -> dict:
 
     # 统一换算为精确整数量子：此后全部水量平衡/容量判定零舍入
     (scale, cap_q, v0_q, qsafe_step_q,
-     openings_step_q, inflows_step_q) = _to_int_quantum(
+     openings_step_q, inflows_step_q, _extra_q) = _to_int_quantum(
         capacity, v0, dt_s, q_safe, openings, inflows)
 
     echo = {
@@ -470,72 +483,15 @@ def solve(params: dict) -> dict:
 
     # ---------- 第零层诊断：预报开始时库容已超容（精确整数比较） ----------
     if v0_q > cap_q:
-        return {
-            "feasible": False,
-            "params": echo,
-            "infeasible": {
-                "code": "ALREADY_OVERFLOW",
-                "title": "初始库容已超过调蓄池容量",
-                "at_step": 0,
-                "message": (
-                    f"预报开始（第 1 时段之前）库容为 {_qfmt(v0_q, scale)} m³，"
-                    f"已超过容量上限 {_qfmt(cap_q, scale)} m³，"
-                    f"超容 {_qfmt(v0_q - cap_q, scale)} m³。"
-                    "初始状态本身已处于溢流，任何开度序列都无法回溯消除；"
-                    "请先核实初始库容或扩大容量。"
-                ),
-                "suggestions": [
-                    f"核实/降低初始库容至 {_qfmt(cap_q, scale)} m³ 以下",
-                    f"将调蓄池容量扩大至少 {_qfmt(v0_q - cap_q, scale)} m³",
-                ],
-            },
-        }
+        return _already_overflow_block(v0_q, cap_q, scale, echo)
 
     # ---------- 第一层诊断：连"无视切换约束、满管泄放"都溢流 ----------
     greedy = _greedy_max(openings_step_q[-1], inflows_step_q, cap_q, v0_q)
     if greedy["first_overflow"] is not None:
-        k = greedy["first_overflow"]
-        need_step_q = _min_safe_rate_step(inflows_step_q, cap_q, v0_q)
-        need_rate = need_step_q / scale / dt_s          # m³/s（建议文案用）
-        suggestions = [
-            f"将闸门最大泄流能力由 {openings[-1]:g} m³/s 提高至"
-            f"约 {need_rate:.6g} m³/s 以上",
-            f"将调蓄池容量至少扩大约 {_qfmt(greedy['deficit'], scale)} m³"
-            "（按首次溢流时刻缺口计）",
-            "上游采取削峰/错峰措施，降低该时段入流预测",
-        ]
-        return {
-            "feasible": False,
-            "params": echo,
-            "infeasible": {
-                "code": "OVERFLOW_UNAVOIDABLE",
-                "title": "库容必然溢流：泄流能力/库容不足",
-                "at_step": k,
-                "message": (
-                    f"第 {k + 1} 时段末，即使所有时段均以最大档位"
-                    f"（{openings[-1]:g} m³/s）泄放，库容仍达到 "
-                    f"{_qfmt(greedy['rows'][k][2], scale)} m³，"
-                    f"超过容量上限 {_qfmt(cap_q, scale)} m³，"
-                    f"缺口 {_qfmt(greedy['deficit'], scale)} m³。"
-                    "由于满管泄放得到的是逐时段最低可能库容轨迹，"
-                    "因此不存在任何能避免溢流的开度序列。"
-                ),
-                "suggestions": suggestions,
-                "greedy_trajectory": [
-                    {
-                        "t": i,
-                        "storage_start_m3": r[0] / scale,
-                        "release_m3": r[1] / scale,
-                        "storage_end_m3": r[2] / scale,
-                        "overflow_m3": r[3] / scale,
-                    }
-                    for i, r in enumerate(greedy["rows"])
-                ],
-            },
-        }
+        return _overflow_block(greedy, openings_step_q, inflows_step_q,
+                               cap_q, v0_q, scale, dt_s, openings, echo)
 
     # ---------- 第二层：带切换最小间隔约束的精确搜索 ----------
-    result = None
     try:
         result = _search(openings_step_q, inflows_step_q, cap_q, v0_q,
                          min_interval, qsafe_step_q, init_gear, init_held)
@@ -543,80 +499,171 @@ def solve(params: dict) -> dict:
         return _search_limit_response(exc, echo)
 
     if not result.found:
-        # 满管贪心不溢流 -> 物理上可行；不可行只能来自现状档位 + 切换锁定。
-        # 先检验：现状档是否允许立即切换（已保持时间 ≥ 间隔）。
-        already_free = init_held >= min_interval
-        # 二分求"现状档需再保持多久"仍可行：对保持时间 h ∈ [0,K] 试探
-        # （诊断子搜索与主搜索同规模，同样可能触限 —— 触限即规模拒绝）
-        best_h = None
-        lo, hi = 0, min_interval
         try:
-            while lo <= hi:
-                mid = (lo + hi) // 2
-                if _search(openings_step_q, inflows_step_q, cap_q, v0_q,
-                           min_interval, qsafe_step_q, init_gear, mid).found:
-                    best_h = mid
-                    hi = mid - 1
-                else:
-                    lo = mid + 1
+            return _locked_block(result, openings_step_q, inflows_step_q,
+                                 cap_q, v0_q, scale, min_interval,
+                                 qsafe_step_q, init_gear, init_held, openings, echo)
         except SearchLimitExceeded as exc:
             return _search_limit_response(exc, echo)
 
-        # 用"锁定型贪心"见证策略给出被迫溢流的具体时段
-        witness = _locked_greedy(openings_step_q, inflows_step_q, cap_q,
-                                 v0_q, min_interval, init_gear, init_held)
-        at_step = witness["first_overflow"]
-        prune_count = result.prune["overflow_pruned"]
+    # ---------- 可行：组装"不溢流最优序列"的完整可行结果 ----------
+    return _feasible_payload(
+        result, cap_q, v0_q, qsafe_step_q, openings_step_q, inflows_step_q,
+        scale, openings, inflows, dt_s, min_interval, init_gear, init_held, echo)
 
-        if already_free:
-            cause = (
-                "现状档位虽允许立即切换，但在当前切换最小间隔约束下，"
-                "每次换到新档都须连续保持，搜索确认后续所有可达成的档位/库容状态"
-                "都无法避免溢流。"
-            )
-            suggestions = [
-                "减小切换最小间隔，使闸门可以更快逐级提升开度",
-                "增加更高泄流能力的档位，使锁定期间也能跟上入流",
-                "上游错峰，降低连续高入流时段的集中度",
-            ]
+
+def _already_overflow_block(v0_q: int, cap_q: int, scale: int, echo: dict) -> dict:
+    """第零层无解：预报开始时初始库容已超容（精确整数比较）。"""
+    return {
+        "feasible": False,
+        "params": echo,
+        "infeasible": {
+            "code": "ALREADY_OVERFLOW",
+            "title": "初始库容已超过调蓄池容量",
+            "at_step": 0,
+            "message": (
+                f"预报开始（第 1 时段之前）库容为 {_qfmt(v0_q, scale)} m³，"
+                f"已超过容量上限 {_qfmt(cap_q, scale)} m³，"
+                f"超容 {_qfmt(v0_q - cap_q, scale)} m³。"
+                "初始状态本身已处于溢流，任何开度序列都无法回溯消除；"
+                "请先核实初始库容或扩大容量。"
+            ),
+            "suggestions": [
+                f"核实/降低初始库容至 {_qfmt(cap_q, scale)} m³ 以下",
+                f"将调蓄池容量扩大至少 {_qfmt(v0_q - cap_q, scale)} m³",
+            ],
+        },
+    }
+
+
+def _overflow_block(greedy: dict, openings_step_q, inflows_step_q,
+                    cap_q, v0_q, scale, dt_s, openings, echo: dict) -> dict:
+    """第一层无解：连"无视切换约束、满管泄放"都溢流（物理型无解）。"""
+    k = greedy["first_overflow"]
+    need_step_q = _min_safe_rate_step(inflows_step_q, cap_q, v0_q)
+    need_rate = need_step_q / scale / dt_s          # m³/s（建议文案用）
+    suggestions = [
+        f"将闸门最大泄流能力由 {openings[-1]:g} m³/s 提高至"
+        f"约 {need_rate:.6g} m³/s 以上",
+        f"将调蓄池容量至少扩大约 {_qfmt(greedy['deficit'], scale)} m³"
+        "（按首次溢流时刻缺口计）",
+        "上游采取削峰/错峰措施，降低该时段入流预测",
+    ]
+    return {
+        "feasible": False,
+        "params": echo,
+        "infeasible": {
+            "code": "OVERFLOW_UNAVOIDABLE",
+            "title": "库容必然溢流：泄流能力/库容不足",
+            "at_step": k,
+            "message": (
+                f"第 {k + 1} 时段末，即使所有时段均以最大档位"
+                f"（{openings[-1]:g} m³/s）泄放，库容仍达到 "
+                f"{_qfmt(greedy['rows'][k][2], scale)} m³，"
+                f"超过容量上限 {_qfmt(cap_q, scale)} m³，"
+                f"缺口 {_qfmt(greedy['deficit'], scale)} m³。"
+                "由于满管泄放得到的是逐时段最低可能库容轨迹，"
+                "因此不存在任何能避免溢流的开度序列。"
+            ),
+            "suggestions": suggestions,
+            "greedy_trajectory": [
+                {
+                    "t": i,
+                    "storage_start_m3": r[0] / scale,
+                    "release_m3": r[1] / scale,
+                    "storage_end_m3": r[2] / scale,
+                    "overflow_m3": r[3] / scale,
+                }
+                for i, r in enumerate(greedy["rows"])
+            ],
+        },
+    }
+
+
+def _locked_block(result: SearchResult, openings_step_q, inflows_step_q,
+                  cap_q, v0_q, scale, min_interval, qsafe_step_q,
+                  init_gear, init_held, openings, echo: dict) -> dict:
+    """第三层无解：满管贪心不溢流，但现状档位 + 切换锁定导致被迫溢流。
+
+    诊断子搜索（二分"现状档需再保持多久"）与主搜索同规模，同样可能触限 ——
+    触限即原样抛出 SearchLimitExceeded，由调用方转述为规模拒绝。
+    """
+    already_free = init_held >= min_interval
+    best_h = None
+    lo, hi = 0, min_interval
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if _search(openings_step_q, inflows_step_q, cap_q, v0_q,
+                   min_interval, qsafe_step_q, init_gear, mid).found:
+            best_h = mid
+            hi = mid - 1
         else:
-            wait = (min_interval - init_held)
-            cause = (
-                f"预报开始时闸门处于 {init_gear + 1} 档"
-                f"（{openings[init_gear]:g} m³/s）且该档只连续保持了 "
-                f"{init_held} 个时段，按最小间隔 {min_interval} 的规则，"
-                f"至少还须保持 {wait} 个时段才能切换；"
-                "锁定期间提不起足够泄量导致库容被迫超容，"
-                "等到允许切换时已来不及。"
-            )
-            h_sug = (f"允许现状档在保持满 {best_h} 个时段后即可切换"
-                     if best_h is not None else "放宽切换最小间隔")
-            suggestions = [
-                h_sug + "（调度预案中预置应急切换权限）",
-                f"将切换最小间隔由 {min_interval} 减小",
-                "增加更高泄流能力的档位，或上游错峰削峰",
-            ]
+            lo = mid + 1
 
-        return {
-            "feasible": False,
-            "params": echo,
-            "infeasible": {
-                "code": "LOCKED_INTERVAL",
-                "title": "闸门切换锁定期间被迫溢流（约束型无解）",
-                "at_step": at_step,
-                "message": (
-                    f"约在第 {(at_step if at_step is not None else 0) + 1} 时段，"
-                    f"所有不溢流的开度组合都被切换规则排除。{cause}"
-                    "注：若无切换间隔限制（可随时满管泄放），方案不会溢流，"
-                    "因此瓶颈是调度约束而非库容或最大泄流能力。"
-                    f"（搜索中因溢流被剪枝的状态转移共 {prune_count} 次）"
-                ),
-                "suggestions": suggestions,
-            },
-            "prune_stats": result.prune,
-        }
+    # 用"锁定型贪心"见证策略给出被迫溢流的具体时段
+    witness = _locked_greedy(openings_step_q, inflows_step_q, cap_q,
+                             v0_q, min_interval, init_gear, init_held)
+    at_step = witness["first_overflow"]
+    prune_count = result.prune["overflow_pruned"]
 
-    # ---------- 可行：按最优序列正向重建轨迹（整数量子）并标注约束触发 ----------
+    if already_free:
+        cause = (
+            "现状档位虽允许立即切换，但在当前切换最小间隔约束下，"
+            "每次换到新档都须连续保持，搜索确认后续所有可达成的档位/库容状态"
+            "都无法避免溢流。"
+        )
+        suggestions = [
+            "减小切换最小间隔，使闸门可以更快逐级提升开度",
+            "增加更高泄流能力的档位，使锁定期间也能跟上入流",
+            "上游错峰，降低连续高入流时段的集中度",
+        ]
+    else:
+        wait = (min_interval - init_held)
+        cause = (
+            f"预报开始时闸门处于 {init_gear + 1} 档"
+            f"（{openings[init_gear]:g} m³/s）且该档只连续保持了 "
+            f"{init_held} 个时段，按最小间隔 {min_interval} 的规则，"
+            f"至少还须保持 {wait} 个时段才能切换；"
+            "锁定期间提不起足够泄量导致库容被迫超容，"
+            "等到允许切换时已来不及。"
+        )
+        h_sug = (f"允许现状档在保持满 {best_h} 个时段后即可切换"
+                 if best_h is not None else "放宽切换最小间隔")
+        suggestions = [
+            h_sug + "（调度预案中预置应急切换权限）",
+            f"将切换最小间隔由 {min_interval} 减小",
+            "增加更高泄流能力的档位，或上游错峰削峰",
+        ]
+
+    return {
+        "feasible": False,
+        "params": echo,
+        "infeasible": {
+            "code": "LOCKED_INTERVAL",
+            "title": "闸门切换锁定期间被迫溢流（约束型无解）",
+            "at_step": at_step,
+            "message": (
+                f"约在第 {(at_step if at_step is not None else 0) + 1} 时段，"
+                f"所有不溢流的开度组合都被切换规则排除。{cause}"
+                "注：若无切换间隔限制（可随时满管泄放），方案不会溢流，"
+                "因此瓶颈是调度约束而非库容或最大泄流能力。"
+                f"（搜索中因溢流被剪枝的状态转移共 {prune_count} 次）"
+            ),
+            "suggestions": suggestions,
+        },
+        "prune_stats": result.prune,
+    }
+
+
+def _feasible_payload(result: SearchResult, cap_q, v0_q, qsafe_step_q,
+                      openings_step_q, inflows_step_q, scale,
+                      openings, inflows, dt_s, min_interval,
+                      init_gear, init_held, echo: dict,
+                      extra: Optional[dict] = None) -> dict:
+    """按最优序列正向重建逐时段轨迹，组装完整的"可行"结果。
+
+    extra（如容量反算的 plan 段）若非空，原样并入返回顶层。
+    """
     steps, agg = _build_steps(chosen=result.chosen, openings=openings,
                               openings_step=openings_step_q, inflows=inflows,
                               inflows_step=inflows_step_q, capacity=cap_q,
@@ -628,11 +675,12 @@ def solve(params: dict) -> dict:
     if v0_q > max_storage_q:
         max_storage_q = v0_q
     max_storage = max_storage_q / scale
+    capacity = cap_q / scale
 
     summary = {
         "total_inflow_m3": sum(inflows_step_q) / scale,
         "total_release_m3": agg["release_sum"] / scale,
-        "final_storage_m3": steps[-1]["storage_end_m3"] if steps else v0,
+        "final_storage_m3": steps[-1]["storage_end_m3"] if steps else echo["initial_storage_m3"],
         "max_storage_m3": max_storage,
         "max_storage_utilization": min(1.0, max_storage / capacity) if capacity > 0 else 0.0,
         "peak_release_m3s": agg["peak_release"] / scale / dt_s,
@@ -642,7 +690,7 @@ def solve(params: dict) -> dict:
         "overflow_m3": 0.0,
     }
 
-    return {
+    payload = {
         "feasible": True,
         "params": echo,
         "steps": steps,
@@ -656,6 +704,290 @@ def solve(params: dict) -> dict:
         },
         "prune_stats": result.prune,
     }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+# ============================================================================
+# 容量反算（size-capacity）：给定超标预算 B 与设计容量上界 U，在接口输入的
+# "共同十进制量子" q=10^-D m³ 网格上，求满足  全程不溢流 且 超标总量 ≤ B
+# 的最小设计库容 C*；在 C* 上按 solve 的既有目标选出见证序列。
+#
+# 可行性谓词（对容量 C 精确判定）：
+#     F(C) := 存在一条满足切换锁定约束的档位序列，使全程不溢流 且
+#             该序列的最优超标总量 e*(C) ≤ B
+# 其中 e*(C) 由既有精确 DP（_search，目标①即超标总量）给出 —— 容量判定与
+# 超标累计全部在同一套整数量子上完成，故 F 是**精确**的（无容差、无舍入）。
+#
+# 单调性：F(C) 关于 C 单调不减。证明：水量平衡映射 V_end = max(0, V+I−o·Δt)
+# 对容量参数本身无依赖，容量只在"V_end ≤ C"这一步做可行性截断；C 增大只会
+# 放开状态（更小容量下存活的每条轨迹在更大容量下同样存活，其超标量不变），
+# 故 e*(C) 单调不增、可达序列集合单调扩大。因此 C* 是良定义的单一阈值，
+# 可在整数网格 [v0, U] 上做二分；任一试算 SEARCH_LIMIT 都意味着该次 F(C)
+# 的真值**未知**，单调性区间不能继续收缩 —— 整个请求必须规模拒绝。
+#
+# 容量候选网格：D 取 初始库容 / 容量上界 / 超标预算 / 各单时段水量 的最大
+# 小数位，v0、U、B 与 C* 都是 q 的整数倍（输入是有限十进制，换算零舍入）。
+# ============================================================================
+
+def _plan_echo(params: dict, n: int, cap_hi: float) -> dict:
+    """容量反算请求的参数回显（不含具体设计容量；见证结果里另填 C*）。"""
+    return {
+        "initial_storage_m3": float(params["initial_storage_m3"]),
+        "dt_s": float(params["dt_s"]),
+        "q_safe": float(params["q_safe"]),
+        "min_interval": int(params["min_interval"]),
+        "openings": sorted({float(x) for x in params["openings"]}),
+        "inflows": [float(x) for x in params["inflows"]],
+        "initial_opening_index": int(params.get("initial_opening_index", 1)),
+        "initial_held": int(params.get("initial_held", 0)),
+        "steps_count": n,
+        "allowed_exceed_m3": float(params["allowed_exceed_m3"]),
+        "capacity_upper_m3": cap_hi,
+    }
+
+
+def _plan_meta(*, cap_hi_q, v0_q, budget_q, scale, grid_min_q,
+               trials, infeasible_low_q, feasible_high_q, found_star,
+               star_q=None, upper_infeasible: bool = False) -> dict:
+    """组装容量反算的 plan 段（搜索区间、量子、试算日志）。"""
+    def m3(qv):
+        return None if qv is None else qv / scale
+    note = None
+    if upper_infeasible:
+        # 上界 U 已被精确证明不可行；可行性谓词关于容量单调，故整个候选网格
+        # [V0, U] 上的每个容量都不可行，已证不可行侧的右端点就是 U。
+        note = (
+            "设计容量上界处已被精确证明不可行；可行性关于容量单调，"
+            "故候选网格内不大于该上界的容量全部不可行（不可行下界即上界本身）。")
+    elif infeasible_low_q is None and found_star:
+        # 唯一 null 情形：答案 C*=网格最小点（初始库容=0），其下一个量子为 −q，
+        # 不是非负容量，无法把"不可行下界"表示成容量值。
+        note = (
+            "最小设计库容恰为网格最小点（初始库容）；其再小一个量子即为负容量，"
+            "不存在可表示的非负候选，故不可行下界以 null 表示。")
+    return {
+        "allowed_exceed_m3": budget_q / scale,
+        "capacity_upper_m3": cap_hi_q / scale,
+        "quantum_m3": 1 / scale,
+        "grid_minimum_m3": grid_min_q / scale,
+        "minimum_capacity_m3": m3(star_q) if found_star else None,
+        "infeasible_below_m3": m3(infeasible_low_q),
+        "feasible_at_or_above_m3": m3(feasible_high_q),
+        "infeasible_low_note": note,
+        "trials_count": len(trials),
+        "trials": trials,
+    }
+
+
+def size_capacity(params: dict) -> dict:
+    """容量反算主入口。params 字段见 schemas.CapacityPlanInput。
+
+    返回：
+      可行        -> feasible=True，steps/summary/objective 为 C* 上的见证序列，
+                     plan 段含最小容量、已证不可行下界/可行上界、量子与试算日志；
+      上界不可行  -> feasible=False，infeasible.code ∈
+                     {OVERFLOW_UNAVOIDABLE, LOCKED_INTERVAL, BUDGET_INFEASIBLE}，
+                     plan 段含已证实的搜索区间；
+      规模拒绝    -> feasible=False，infeasible.code="SEARCH_LIMIT"：
+                     任一试算触限，整个请求拒绝（未完成试算绝不当作不可行）。
+    """
+    v0 = float(params["initial_storage_m3"])
+    dt_s = float(params["dt_s"])
+    q_safe = float(params["q_safe"])
+    min_interval = int(params["min_interval"])
+    openings = sorted({float(x) for x in params["openings"]})
+    inflows = [float(x) for x in params["inflows"]]
+    init_gear = int(params.get("initial_opening_index", 1)) - 1
+    init_held = int(params.get("initial_held", 0))
+    allowed = float(params["allowed_exceed_m3"])
+    cap_hi = float(params["capacity_upper_m3"])
+    n = len(inflows)
+
+    # 共同十进制量子：容量上界与超标预算也参与定标，保证二者恰为整数个量子
+    (scale, cap_hi_q, v0_q, qsafe_step_q,
+     openings_step_q, inflows_step_q, extra_q) = _to_int_quantum(
+        cap_hi, v0, dt_s, q_safe, openings, inflows,
+        extra_m3=[allowed, v0])
+    budget_q = extra_q[0]
+    # extra_q[1] == v0_q（v0 参与定标后仍是精确整数，无需回取）
+
+    echo = _plan_echo({**params, "openings": openings, "inflows": inflows}, n, cap_hi)
+    grid_min_q = v0_q                      # 设计容量至少要装得下初始库容
+
+    # ---- 第零层：初始库容已高于设计上界（物理不可能，无需试算） ----
+    if v0_q > cap_hi_q:
+        echo["capacity_m3"] = cap_hi
+        block = _already_overflow_block(v0_q, cap_hi_q, scale, echo)
+        block["plan"] = _plan_meta(
+            cap_hi_q=cap_hi_q, v0_q=v0_q, budget_q=budget_q, scale=scale,
+            grid_min_q=grid_min_q, trials=[],
+            infeasible_low_q=None, feasible_high_q=None, found_star=False)
+        return block
+
+    trials: list = []
+
+    def run_trial(cap_q: int) -> SearchResult:
+        """在给定候选容量上做一次精确试算；触限原样上抛（调用方必须规模拒绝）。"""
+        return _search(openings_step_q, inflows_step_q, cap_q, v0_q,
+                       min_interval, qsafe_step_q, init_gear, init_held)
+
+    def log_trial(cap_q: int, kind: str, result: Optional[SearchResult],
+                  lo_q, hi_q):
+        entry = {
+            "capacity_m3": cap_q / scale,
+            "verdict": kind,                  # feasible / overflow / locked / rejected(不应出现)
+            "bracket_infeasible_below_m3": (lo_q / scale if lo_q is not None and lo_q >= 0 else None),
+            "bracket_feasible_at_or_above_m3": (hi_q / scale if hi_q is not None else None),
+        }
+        if result is not None:
+            entry["min_exceed_m3"] = (result.cost[0] / scale
+                                      if result.found else None)
+        trials.append(entry)
+
+    # ---- 上界试算：U 可行是继续二分的前提（其触限必须整体规模拒绝） ----
+    try:
+        hi_res = run_trial(cap_hi_q)
+    except SearchLimitExceeded as exc:
+        echo["capacity_m3"] = cap_hi
+        resp = _search_limit_response(exc, echo)
+        resp["plan"] = _plan_meta(
+            cap_hi_q=cap_hi_q, v0_q=v0_q, budget_q=budget_q, scale=scale,
+            grid_min_q=grid_min_q, trials=trials,
+            infeasible_low_q=None, feasible_high_q=None, found_star=False)
+        return resp
+
+    # 分析型已知不可行上界（无需再试算，直接给原因）
+    if not hi_res.found:
+        echo["capacity_m3"] = cap_hi
+        # 先判物理型（满管也溢流）还是约束型（切换锁定）
+        greedy = _greedy_max(openings_step_q[-1], inflows_step_q,
+                             cap_hi_q, v0_q)
+        if greedy["first_overflow"] is not None:
+            block = _overflow_block(greedy, openings_step_q, inflows_step_q,
+                                    cap_hi_q, v0_q, scale, dt_s, openings, echo)
+        else:
+            try:
+                block = _locked_block(hi_res, openings_step_q, inflows_step_q,
+                                      cap_hi_q, v0_q, scale, min_interval,
+                                      qsafe_step_q, init_gear, init_held,
+                                      openings, echo)
+            except SearchLimitExceeded as exc:
+                resp = _search_limit_response(exc, echo)
+                resp["plan"] = _plan_meta(
+                    cap_hi_q=cap_hi_q, v0_q=v0_q, budget_q=budget_q, scale=scale,
+                    grid_min_q=grid_min_q, trials=trials,
+                    infeasible_low_q=None, feasible_high_q=None, found_star=False)
+                return resp
+        log_trial(cap_hi_q,
+                  "overflow" if greedy["first_overflow"] is not None else "locked",
+                  hi_res, cap_hi_q, None)
+        block["feasible"] = False
+        block["plan"] = _plan_meta(
+            cap_hi_q=cap_hi_q, v0_q=v0_q, budget_q=budget_q, scale=scale,
+            grid_min_q=grid_min_q, trials=trials,
+            infeasible_low_q=cap_hi_q, feasible_high_q=None, found_star=False,
+            upper_infeasible=True)
+        return block
+
+    # 上界处存在不溢流序列，但超标预算可能仍达不到
+    hi_exceed_q = hi_res.cost[0]
+    if hi_exceed_q > budget_q:
+        echo["capacity_m3"] = cap_hi
+        witness_echo = dict(echo)
+        witness = _feasible_payload(
+            hi_res, cap_hi_q, v0_q, qsafe_step_q, openings_step_q,
+            inflows_step_q, scale, openings, inflows, dt_s, min_interval,
+            init_gear, init_held, witness_echo)
+        log_trial(cap_hi_q, "budget", hi_res, cap_hi_q, None)
+        block = {
+            "feasible": False,
+            "params": echo,
+            "infeasible": {
+                "code": "BUDGET_INFEASIBLE",
+                "title": "设计容量上界处仍无法满足超标预算（预算型不可行）",
+                "at_step": None,
+                "message": (
+                    f"即使把设计库容取到允许的上界 {_qfmt(cap_hi_q, scale)} m³，"
+                    f"在切换最小间隔 {min_interval} 的约束下，全程不溢流序列能达到的"
+                    f"最小下游超标总量仍为 {_qfmt(hi_exceed_q, scale)} m³，"
+                    f"高于允许的超标预算 {_qfmt(budget_q, scale)} m³"
+                    f"（还差 {_qfmt(hi_exceed_q - budget_q, scale)} m³）。"
+                    "更大库容只能消除溢流，不能进一步压低超标：超标来自闸门档位"
+                    "的过流能力本身（高档位泄量超过下游安全流量），故继续扩容"
+                    "也无法满足该预算。"
+                ),
+                "suggestions": [
+                    f"将允许的下游超标总量由 {_qfmt(budget_q, scale)} m³ "
+                    f"放宽到至少 {_qfmt(hi_exceed_q, scale)} m³",
+                    "增加更贴近下游安全流量的闸门档位（低过流能力档），"
+                    "使压库期间不必长时间高泄",
+                    "上游削峰/错峰，降低需要大泄量赶水的时段集中度",
+                ],
+            },
+            "witness": witness,
+        }
+        block["plan"] = _plan_meta(
+            cap_hi_q=cap_hi_q, v0_q=v0_q, budget_q=budget_q, scale=scale,
+            grid_min_q=grid_min_q, trials=trials,
+            infeasible_low_q=cap_hi_q, feasible_high_q=None, found_star=False,
+            upper_infeasible=True)
+        return block
+
+    # ---- 二分求最小可行容量（整数网格；单调性见模块段注释） ----
+    # lo_q：已证不可行侧（初值 v0−1 是解析下界：容量装不下初始库容，
+    #        无需试算；为负时区间展示用 null）；hi_q：已证可行侧。
+    lo_q = grid_min_q - 1
+    hi_q = cap_hi_q
+    star_res: Optional[SearchResult] = hi_res
+    log_trial(cap_hi_q, "feasible", hi_res, lo_q, hi_q)
+
+    while hi_q - lo_q > 1:
+        mid_q = (lo_q + hi_q) // 2
+        try:
+            res = run_trial(mid_q)
+        except SearchLimitExceeded as exc:
+            # 该试算真值未知：绝不能把它当成不可行而收缩 lo。整个请求规模拒绝，
+            # 并带回此前已严格证实的区间（不含本次未完成试算）。
+            echo["capacity_m3"] = cap_hi
+            resp = _search_limit_response(exc, echo)
+            resp["plan"] = _plan_meta(
+                cap_hi_q=cap_hi_q, v0_q=v0_q, budget_q=budget_q, scale=scale,
+                grid_min_q=grid_min_q, trials=trials,
+                infeasible_low_q=(lo_q if lo_q >= 0 else None),
+                feasible_high_q=hi_q, found_star=False)
+            return resp
+        ok = res.found and res.cost[0] <= budget_q
+        if ok:
+            hi_q = mid_q
+            star_res = res
+            log_trial(mid_q, "feasible", res, lo_q, hi_q)
+        else:
+            lo_q = mid_q
+            # 不可行原因仅供日志：溢流/锁定（found=False）或超预算（found=True）
+            kind = ("budget" if res.found else "infeasible")
+            log_trial(mid_q, kind, res, lo_q, hi_q)
+
+    star_q = hi_q
+    proven_low_q = lo_q if lo_q >= 0 else None
+
+    # ---- 在 C* 上按既有目标（超标→切换→峰值出流→峰值库容）选见证序列 ----
+    echo["capacity_m3"] = star_q / scale
+    plan = _plan_meta(
+        cap_hi_q=cap_hi_q, v0_q=v0_q, budget_q=budget_q, scale=scale,
+        grid_min_q=grid_min_q, trials=trials,
+        infeasible_low_q=proven_low_q, feasible_high_q=star_q,
+        found_star=True, star_q=star_q)
+    payload = _feasible_payload(
+        star_res, star_q, v0_q, qsafe_step_q, openings_step_q,
+        inflows_step_q, scale, openings, inflows, dt_s, min_interval,
+        init_gear, init_held, echo, extra={"plan": plan})
+    # 见证序列的超标总量恰为 e*(C*)，且 ≤ 预算（二分可行性已精确保证）
+    payload["plan"]["witness_exceed_within_budget"] = (
+        star_res.cost[0] <= budget_q)
+    return payload
+
 
 
 def _locked_greedy(openings_step, inflows_step, capacity, v0,

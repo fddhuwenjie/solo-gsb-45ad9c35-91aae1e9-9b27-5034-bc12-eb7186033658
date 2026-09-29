@@ -72,6 +72,24 @@
       <div id="inflows" class="cell-inputs"></div>
     </div>
 
+    <div class="sub-block plan-block">
+      <div class="sub-head">
+        <h3>容量规划（容量反算）</h3>
+      </div>
+      <p class="hint">沿用上方入流、档位、切换间隔与初始状态；另填「允许的下游超标总量」
+        与「设计容量上界」，在输入共同的十进制量子网格上反求满足超标预算且全程不溢流的
+        <b>最小设计库容</b>，并给出该库容下的见证序列与已证实的搜索区间。</p>
+      <div class="field-grid" style="margin-top:10px">
+        <label>允许的下游超标总量 (m³)
+          <input id="f-allowed-exceed" type="number" min="0" step="100" value="0">
+        </label>
+        <label>设计容量上界 (m³)
+          <input id="f-cap-upper" type="number" min="1" step="100" value="120000">
+        </label>
+      </div>
+      <button id="btn-size" class="btn btn-accent" type="button">📏 容量反算最小库容</button>
+    </div>
+
     <div class="actions">
       <button id="btn-solve" class="btn btn-primary">▶ 立即推演</button>
       <button id="btn-save" class="btn">保存场景</button>
@@ -95,6 +113,7 @@
 
     <div id="result" hidden>
       <div id="verdict"></div>
+      <div id="plan-card"></div>
       <div id="chips" class="chips"></div>
       <div id="charts"></div>
       <div id="table-wrap"></div>

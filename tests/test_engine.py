@@ -408,4 +408,208 @@ replay_exact(p19, r19["steps"])
 water_balance_ok(r19)
 print("case19: high-precision + switch-lock matches exact brute force:", got19)
 
+# ==========================================================================
+# 容量反算 size_capacity
+# ==========================================================================
+from app.engine import size_capacity
+import app.engine as _sizing_engine
+
+def plan_base(**kw):
+    p = dict(
+        name="plan", initial_storage_m3=2000, dt_s=3600.0, q_safe=10,
+        min_interval=2, initial_opening_index=1, initial_held=0,
+        openings=[0, 3, 6, 9, 12, 16],
+        inflows=[2, 5, 12, 20, 18, 12, 7, 4, 2, 1, 0, 0],
+        allowed_exceed_m3=0, capacity_upper_m3=80000,
+    )
+    p.update(kw)
+    return p
+
+# 20) 容量反算 vs Fraction 精确穷举：阈值正确、谓词单调、逐试算判定一致
+def brute_min_exceed(p, cap):
+    """精确穷举给定容量下的最小超标总量（Fraction）；None=任何序列都溢流。"""
+    dt = Fraction(str(p["dt_s"])); v0 = Fraction(str(p["initial_storage_m3"]))
+    capF = Fraction(str(cap))
+    o = [Fraction(str(x)) * dt for x in p["openings"]]
+    I = [Fraction(str(x)) * dt for x in p["inflows"]]
+    qs = Fraction(str(p["q_safe"])) * dt
+    g0 = p["initial_opening_index"] - 1
+    best = None
+    for seq in itertools.product(range(len(o)), repeat=len(I)):
+        v = v0; g = g0; rn = p["initial_held"]; ok = True; e = Fraction(0)
+        for t, j in enumerate(seq):
+            if rn < p["min_interval"] and j != g:
+                ok = False; break
+            rn = 1 if j != g else rn + 1; g = j
+            rel = min(o[j], v + I[t]); v = v + I[t] - rel
+            if v > capF:
+                ok = False; break
+            if rel > qs:
+                e += rel - qs
+        if ok and (best is None or e < best):
+            best = e
+    return best
+
+p20 = plan_base(q_safe=10, openings=[0, 6, 12, 16],
+                inflows=[2, 5, 12, 20, 18, 12, 7, 4],
+                allowed_exceed_m3=60000, capacity_upper_m3=60000)
+r20 = size_capacity(p20)
+assert r20["feasible"], r20.get("infeasible")
+pl20 = r20["plan"]
+star20 = pl20["minimum_capacity_m3"]; q20 = pl20["quantum_m3"]
+assert q20 == 1.0
+assert pl20["infeasible_below_m3"] == star20 - q20
+assert pl20["feasible_at_or_above_m3"] == star20
+assert p20["initial_storage_m3"] < star20 < p20["capacity_upper_m3"]
+# 精确穷举阈值两侧
+b_star = brute_min_exceed(p20, star20)
+b_below = brute_min_exceed(p20, star20 - q20)
+assert b_star is not None and b_star <= Fraction(60000)
+assert b_below is None or b_below > Fraction(60000)
+# 谓词在粗网格上单调：容量越大越可行（只允许 不可行→可行 一次越过阈值，
+# 禁止出现"小容量可行、大容量反而不可行"）
+prev_inf = None
+for c in range(2000, 60001, 1000):
+    b = brute_min_exceed(p20, c)
+    inf = (b is None) or (b > Fraction(60000))
+    if prev_inf is False and inf is True:
+        raise AssertionError(f"可行性谓词单调性被破坏 at c={c}")
+    prev_inf = inf
+# 引擎每一次试算的判定/最小超标都与穷举一致
+for tr in pl20["trials"]:
+    b = brute_min_exceed(p20, tr["capacity_m3"])
+    assert (tr["verdict"] == "feasible") == (b is not None and b <= Fraction(60000)), tr
+    if b is not None:
+        assert abs(tr["min_exceed_m3"] - float(b)) < 1e-9
+# 见证轨迹：不溢流、不超标过预算、库容峰值 ≤ C*
+assert r20["summary"]["max_storage_m3"] <= star20 + 1e-9
+assert r20["summary"]["total_exceed_m3"] <= 60000 + 1e-9
+water_balance_ok(r20)
+print("case20: size_capacity exact threshold C* =", star20,
+      "in", pl20["trials_count"], "trials; brute predicate monotone & matching")
+
+# 21) 容量上界仍不可行的三种原因
+# (a) 物理型：上界处满管也溢流
+r21a = size_capacity(plan_base(min_interval=1, initial_held=1,
+                               openings=[0, 3, 6, 9, 12], capacity_upper_m3=30000))
+assert not r21a["feasible"] and r21a["infeasible"]["code"] == "OVERFLOW_UNAVOIDABLE"
+assert len(r21a["infeasible"]["greedy_trajectory"]) == 12
+assert r21a["plan"]["minimum_capacity_m3"] is None
+# 上界不可行 + 单调性 ⇒ 整个候选网格 [V0, U] 均不可行：不可行下界取 U、可行上界为 null
+assert r21a["plan"]["infeasible_below_m3"] == 30000
+assert r21a["plan"]["feasible_at_or_above_m3"] is None
+assert r21a["plan"]["infeasible_low_note"]
+print("case21a: upper OVERFLOW_UNAVOIDABLE")
+# (b) 预算型：上界不溢流但超标压不到预算；返回上界处的见证序列
+r21b = size_capacity(plan_base(q_safe=3, allowed_exceed_m3=1.0))
+assert not r21b["feasible"] and r21b["infeasible"]["code"] == "BUDGET_INFEASIBLE"
+w21b = r21b["witness"]
+assert w21b["feasible"] and w21b["summary"]["total_exceed_m3"] > 1.0
+assert w21b["params"]["capacity_m3"] == 80000
+assert r21b["plan"]["infeasible_below_m3"] == 80000
+assert r21b["plan"]["feasible_at_or_above_m3"] is None
+water_balance_ok(w21b)
+print("case21b: BUDGET_INFEASIBLE, min exceed at upper =",
+      w21b["summary"]["total_exceed_m3"])
+# (c) 约束型：上界受切换锁定所限无解（无锁定时不溢流）
+r21c = size_capacity(plan_base(min_interval=3))
+assert not r21c["feasible"] and r21c["infeasible"]["code"] == "LOCKED_INTERVAL"
+assert r21c["infeasible"]["at_step"] is not None
+assert r21c["plan"]["minimum_capacity_m3"] is None
+assert r21c["plan"]["infeasible_below_m3"] == 80000
+assert r21c["plan"]["feasible_at_or_above_m3"] is None
+print("case21c: upper LOCKED_INTERVAL at t =", r21c["infeasible"]["at_step"] + 1)
+# (d) 初始库容已高于设计上界
+r21d = size_capacity(plan_base(initial_storage_m3=90000, capacity_upper_m3=80000))
+assert not r21d["feasible"] and r21d["infeasible"]["code"] == "ALREADY_OVERFLOW"
+print("case21d: initial storage above upper -> ALREADY_OVERFLOW")
+
+# 22) 任一试算触发 SEARCH_LIMIT：整个请求规模拒绝，未完成试算不得当作不可行
+flaky_calls = {"n": 0}
+_orig_search = _sizing_engine._search
+def _flaky_search(*a, **k):
+    flaky_calls["n"] += 1
+    if flaky_calls["n"] == 3:      # 上界(1)、首个中点(2) 已完成；第 3 次试算触限
+        from app.engine import SearchLimitExceeded
+        raise SearchLimitExceeded(12345, 4)
+    return _orig_search(*a, **k)
+_sizing_engine._search = _flaky_search
+try:
+    r22 = size_capacity(plan_base(q_safe=10, allowed_exceed_m3=100000))
+finally:
+    _sizing_engine._search = _orig_search
+assert not r22["feasible"] and r22["infeasible"]["code"] == "SEARCH_LIMIT"
+assert "steps" not in r22 and r22["plan"]["minimum_capacity_m3"] is None
+# 只有 2 次已完成试算进入日志；第 3 次（未完成）不得标记为不可行
+assert len(r22["plan"]["trials"]) == 2
+assert all(t["verdict"] == "feasible" for t in r22["plan"]["trials"])
+# 已证实的可行上界随第 2 次试算收缩，但不会被未完成试算进一步收缩
+assert r22["plan"]["feasible_at_or_above_m3"] == 40999.0
+assert r22["plan"]["infeasible_below_m3"] == 1999.0
+print("case22: SEARCH_LIMIT on 3rd trial -> whole request rejected, bracket =",
+      r22["plan"]["infeasible_below_m3"], r22["plan"]["feasible_at_or_above_m3"])
+
+# 23) 分数量子（q=1e-6 m³）反算：阈值精确到 1 个量子，与 Fraction 穷举一致
+p23 = dict(name="fq", initial_storage_m3=50.0, dt_s=5, q_safe=0.0, min_interval=1,
+           initial_opening_index=1, initial_held=1,
+           openings=[0, 0.000005], inflows=[0.000001] * 12,
+           allowed_exceed_m3=0.000035, capacity_upper_m3=50.00005)
+r23 = size_capacity(dict(p23))
+assert r23["feasible"], r23.get("infeasible")
+assert r23["plan"]["quantum_m3"] == 1e-6
+assert r23["plan"]["minimum_capacity_m3"] == 50.000035
+assert r23["plan"]["infeasible_below_m3"] == 50.000034
+def _min_ex23(cap):
+    o = [Fraction(0), Fraction("0.000005") * 5]
+    I = Fraction("0.000001") * 5
+    best = None
+    for seq in itertools.product(range(2), repeat=12):
+        v = Fraction("50"); ok = True; e = Fraction(0)
+        for j in seq:
+            rel = min(o[j], v + I); v = v + I - rel
+            if v > Fraction(str(cap)):
+                ok = False; break
+            e += rel
+        if ok and (best is None or e < best):
+            best = e
+    return best
+assert _min_ex23("50.000035") <= Fraction("0.000035")
+assert _min_ex23("50.000034") > Fraction("0.000035")
+assert abs(r23["summary"]["total_exceed_m3"] - 0.000025) < 1e-12
+water_balance_ok(r23)
+print("case23: fractional quantum q=1e-6 -> C* =", r23["plan"]["minimum_capacity_m3"])
+
+# 24) C* 上的见证序列/目标与 solve(C*) 完全一致（沿用既有目标选见证）
+s24 = solve(dict(p23, capacity_m3=r23["plan"]["minimum_capacity_m3"]))
+assert [x["opening_index"] for x in s24["steps"]] == \
+       [x["opening_index"] for x in r23["steps"]]
+assert s24["objective"] == r23["objective"]
+# 整数量子场景同样核对一次（p20：8 时段 × 4 档）
+s24b = solve(dict(p20, capacity_m3=star20))
+r24b = size_capacity(dict(p20))
+assert [x["opening_index"] for x in s24b["steps"]] == \
+       [x["opening_index"] for x in r24b["steps"]]
+assert s24b["objective"] == r24b["objective"]
+print("case24: witness sequence/objective identical to solve(C*)")
+
+# 25) 网格下沿边界：初始库容即可行（C*=网格最小点）时，不可行下界为 null 且附说明
+p25 = dict(name="edge0", initial_storage_m3=0, dt_s=3600, q_safe=10, min_interval=1,
+           initial_opening_index=1, initial_held=1,
+           openings=[0, 3, 6], inflows=[0, 0, 0],
+           allowed_exceed_m3=0, capacity_upper_m3=80000)
+r25 = size_capacity(dict(p25))
+assert r25["feasible"]
+assert r25["plan"]["minimum_capacity_m3"] == 0
+assert r25["plan"]["infeasible_below_m3"] is None
+assert r25["plan"]["feasible_at_or_above_m3"] == 0
+assert r25["plan"]["infeasible_low_note"]
+# 上界即不可行（锁定）时，整段网格均不可行，同样给出 null 下界说明
+p25b = dict(plan_base(min_interval=3), allowed_exceed_m3=0)
+r25b = size_capacity(dict(p25b))
+assert not r25b["feasible"] and r25b["infeasible"]["code"] == "LOCKED_INTERVAL"
+assert r25b["plan"]["infeasible_below_m3"] == 80000
+assert r25b["plan"]["feasible_at_or_above_m3"] is None
+assert r25b["plan"]["infeasible_low_note"]
+print("case25: grid lower edge -> null infeasible bound with note")
+
 print("\nALL ENGINE TESTS PASSED")

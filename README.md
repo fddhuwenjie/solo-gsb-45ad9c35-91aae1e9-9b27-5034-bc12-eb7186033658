@@ -1,6 +1,6 @@
 # 城市雨洪调蓄池泄放序列推演台
 
-按时段搜索闸门开度序列的调度推演工具：**先保证调蓄池不溢流，再在所有可行序列中最小化下游安全流量超标总量**，并逐时段展示库容、实际出流、触发的约束事件及无解原因。
+按时段搜索闸门开度序列的调度推演工具：**先保证调蓄池不溢流，再在所有可行序列中最小化下游安全流量超标总量**，并逐时段展示库容、实际出流、触发的约束事件及无解原因。另为方案设计人员提供**容量反算**：给定允许的下游超标总量与设计容量上界，在输入共同的十进制量子网格上反求**满足超标预算且全程不溢流的最小设计库容**，并给出该库容下的见证序列与已证实的搜索区间。
 
 - **后端**：Python 3.12 + FastAPI + SQLite（无 ORM，标准库 `sqlite3`）
 - **前端**：原生 HTML / CSS / JavaScript（零构建、零前端框架，纯 SVG 自绘图表）
@@ -20,8 +20,10 @@ docker compose up --build
 
 > **http://localhost:8000**
 
+打开页面后，左栏录入参数即可使用「▶ 立即推演」与「📏 容量反算最小库容」；接口基址同为 `http://localhost:8000`（如 `http://localhost:8000/api/health`、`http://localhost:8000/api/size-capacity`）。
+
 停止：`Ctrl+C`（后台运行用 `docker compose up -d --build`，停止用 `docker compose down`）。
-场景与推演历史持久化在 Docker 卷 `basin-data`（容器内 `/data/basin.db`）中，重建容器不丢失。
+场景与推演历史持久化在 Docker 卷 `basin-data`（容器内 `/data/basin.db`）中，重建容器不丢失。容量反算为即席计算，不写入数据库。
 
 ---
 
@@ -58,6 +60,24 @@ docker compose up --build
    - `EMPTY` 库内水量不足、实际出流低于档位能力；`NORMAL` 一切正常。
 6. **搜索过程统计**：溢流剪枝次数、首次剪空时段、最大层状态数、最大单桶前沿点数、`exact` 是否精确解（恒为 `true`）。
 
+### 容量规划（容量反算）
+左侧「容量规划」区沿用上方全部既有输入（入流、闸门档位、切换最小间隔、初始档位/已保持时长、初始库容、安全流量），只需另填两项：
+
+| 参数 | 含义 |
+|---|---|
+| 允许的下游超标总量 | 超标预算 `B`（m³）：全程下游超标水量之和的允许上限（填 0 = 要求完全不超标） |
+| 设计容量上界 | 反算二分允许考虑的最大设计库容 `U`（m³），必须 ≥ 初始库容 |
+
+点击 **📏 容量反算最小库容**（`POST /api/size-capacity`，不入库）后，系统在「接口输入的共同十进制量子」网格上精确求出**满足预算且全程不溢流的最小设计库容 C\***，并展示：
+
+1. **最小设计库容 C\*** 与「已证不可行下界」（C\* 减一个量子，严格不可行）、「已证可行上界」（恰为 C\*）；
+2. **见证序列**：在 C\* 上按既有目标（超标总量→切换次数→峰值出流→峰值库容）选出的最优开度序列，与一次普通推演完全相同地展示逐时段轨迹、出流过程、约束事件与指标；
+3. **逐时段轨迹**：C\* 下的库容/出流过程图与明细表（库容线恰以 C\* 为上限）；
+4. **搜索区间**：容量轴上红/绿色段标出已被精确证实的不可行/可行区域，以及网格最小点、C\*、设计上界；
+5. **试算日志**：每次精确试算的容量、判定（可行 / 超预算 / 溢流 / 锁定）、该容量下的最小超标量、以及试算后区间的两端。
+
+若设计容量上界本身仍不可行，结果横幅给出原因：满管也溢流（`OVERFLOW_UNAVOIDABLE`）、切换锁定无解（`LOCKED_INTERVAL`）、或**不溢流但最小超标仍高于预算**（`BUDGET_INFEASIBLE`，并附"上界处见证序列"与放宽预算等建议）。**任一试算触发 `SEARCH_LIMIT`，整个请求立即返回规模拒绝**：未完成的试算不会被当作不可行、区间不再继续收缩，并带回此前已严格证实的区间两端。
+
 ---
 
 ## 求解模型
@@ -89,6 +109,16 @@ R(t)   = min( 所选档位过流能力·Δt ,  V(t) + I(t)·Δt )
 - **前沿完整保留，绝不抽稀**：不存在任何"等距丢弃中间状态/截断前沿"的有损环节。因此只要返回 `feasible=true`，`objective` 一定是字典序严格最优，页面与 `prune_stats.exact` 均标注为精确解。48 时段 × 10 档场景单桶前沿可达 1000+ 点，照样无损精确求解。
 - **页面一致性安全网**：前端在展示"精确可行"结论前，会按原始参数复核逐时段容量与水量平衡；任何超容/不守恒的结果都不会被标注为精确可行。
 
+### 容量反算模型（size-capacity）
+
+在推演模型（水量平衡、硬约束、优化目标）完全不变的前提下，把"容量"从输入变为待求量：
+
+- **共同十进制量子**：量子 `q = 10^-D m³`，其中 `D` 取 初始库容 / **设计容量上界** / **超标预算** / 各单时段水量（流量×步长，含安全流量）的最大小数位。初始库容、容量上界、预算以及答案 C\* 都是 `q` 的整数倍，候选容量网格为 `[V0, U]` 上的整数个量子。
+- **精确可行性判定**：对候选容量 `C`，复用既有精确 DP（目标①即超标总量），一次试算同时回答"是否存在不溢流序列"与"最小可达超标总量 `e*(C)`"。`C` 可行 ⇔ 存在全程不溢流序列 且 `e*(C) ≤ B`。容量比较与超标累计全部在整数量子上完成，**无容差、无舍入**。
+- **单调性（二分成立的依据）**：容量只参与"末库容 ≤ C"这一步可行性截断；容量增大只会放开状态（更小容量下存活的每条轨迹在更大容量下同样存活，超标量不变），故 `e*(C)` 单调不增、可行性谓词关于 `C` 单调不减。因此 C\* 是单一阈值，可在整数网格上二分；每次"不可行/可行"试算都严格收缩区间。
+- **最小性与见证**：二分结束时已证 `C*−q` 不可行、`C*` 可行，故 C\* 就是网格上的最小可行容量。在 C\* 上取既有字典序目标的最优解作为**见证序列**（其超标总量即 `e*(C*) ≤ B`、全程不溢流），逐时段轨迹按普通推演的同一套整数重建逻辑生成。
+- **规模拒绝的整请求语义**：试算只可能得到 可行 / 不可行 / **触限（真值未知）** 三种结果。任何一次试算触及 `SEARCH_LIMIT`，该容量的可行性就是未知的，**不得把它当作不可行而继续收缩区间**——整个请求立即返回 `SEARCH_LIMIT` 规模拒绝，并返回此前已完成试算严格证实的区间两端（`plan.infeasible_below_m3` / `plan.feasible_at_or_above_m3`），不带 C\* 与任何见证序列。
+
 ### 规模拒绝（不把近似值标成最优）
 精确求解需要保留全部 Pareto 前沿用于回溯。为防止超大输入耗尽内存，设有三个**资源保护上限**（`app/engine.py`）：
 
@@ -103,10 +133,11 @@ R(t)   = min( 所选档位过流能力·Δt ,  V(t) + I(t)·Δt )
 ### 无解 / 拒绝诊断（四类）
 | code | 含义 | 系统给出的建议 |
 |---|---|---|
-| `ALREADY_OVERFLOW` | 预报开始时 `V0` 已超过容量 | 核实初始库容 / 扩容 |
+| `ALREADY_OVERFLOW` | 预报开始时 `V0` 已超过容量（容量反算中指初始库容超过设计上界，接口层通常已 422 拦截） | 核实初始库容 / 扩容 |
 | `OVERFLOW_UNAVOIDABLE` | 即使忽略一切切换约束、每时段都以最大档位满管泄放仍会溢流——满管泄放得到的是逐时段最低库容轨迹，故任何序列都无解 | 二分计算所需的最小最大泄流能力、首次溢流的库容缺口（扩容方量）、上游削峰错峰；并绘制满管泄放库容轨迹图 |
 | `LOCKED_INTERVAL` | 无切换限制时不溢流，**但初始现状档位 + 最小间隔锁定导致来不及提闸**（纯调度约束型无解） | 二分给出"现状档还需保持多久才可行"、减小 `K`、增加高档泄流能力、错峰 |
-| `SEARCH_LIMIT` | **规模拒绝**：精确求解触及资源保护上限；未做抽稀、未返回近似值 | 减少时段数、合并相近档位、增大切换最小间隔 |
+| `BUDGET_INFEASIBLE` | **仅容量反算**：设计容量上界处存在不溢流序列，但最小超标总量仍高于允许预算（扩容无法消除"档位过流能力本身"造成的超标） | 放宽超标预算 / 增加贴近安全流量的低泄档位 / 上游削峰；附上界处见证序列 |
+| `SEARCH_LIMIT` | **规模拒绝**：精确求解触及资源保护上限；未做抽稀、未返回近似值。容量反算中**任一试算**触限即整请求拒绝，未完成试算不计为不可行 | 减少时段数、合并相近档位、增大切换最小间隔 |
 
 ---
 
@@ -116,13 +147,53 @@ R(t)   = min( 所选档位过流能力·Δt ,  V(t) + I(t)·Δt )
 |---|---|---|
 | GET | `/api/health` | 健康检查 |
 | POST | `/api/solve` | 按请求体参数即席推演（不入库） |
+| POST | `/api/size-capacity` | **容量反算**：求满足超标预算且全程不溢流的最小设计库容（不入库） |
 | GET/POST | `/api/scenarios` | 场景列表 / 新建场景 |
 | GET/PUT/DELETE | `/api/scenarios/{id}` | 场景详情（含最近推演）/ 更新 / 删除（级联删历史） |
 | POST | `/api/scenarios/{id}/run` | 对已保存场景执行一次推演并留存 |
 | GET | `/api/scenarios/{id}/runs` | 该场景的推演历史 |
 | GET | `/api/runs/{id}` | 取回某次历史推演完整结果 |
 
-请求/响应字段见 `app/main.py` 中的 Pydantic 模型，完整结果结构见 `app/engine.py:solve()`。
+请求/响应字段见 `app/main.py` 中的 Pydantic 模型，完整结果结构见 `app/engine.py:solve()` 与 `app/engine.py:size_capacity()`。
+
+#### `POST /api/size-capacity` 接口规则
+
+请求体沿用推演的全部字段，但**不含 `capacity_m3`**，另加：
+
+| 字段 | 校验 | 含义 |
+|---|---|---|
+| `allowed_exceed_m3` | `≥ 0` | 允许的下游超标总量（超标预算，m³） |
+| `capacity_upper_m3` | `> 0` 且 `≥ initial_storage_m3` | 设计容量上界（m³） |
+
+其余字段（`initial_storage_m3`、`dt_s`、`q_safe`、`min_interval`、`openings`、`inflows`、`initial_opening_index`、`initial_held`）与 `/api/solve` 同义；HTTP 200 表示请求被处理，业务结论看 `feasible`。
+
+- `feasible=true`：`steps/summary/objective` 为 **C\*** 上的见证序列（`params.capacity_m3` 即 C\*）；`plan` 段：
+
+  | 字段 | 含义 |
+  |---|---|
+  | `minimum_capacity_m3` | 最小设计库容 C\*（量子的整数倍） |
+  | `infeasible_below_m3` | 已证实的不可行下界（C\*−q；当网格最小点 V0 即不可行且不存在非负的更小候选时为 `null`，含义见 `infeasible_low_note`） |
+  | `feasible_at_or_above_m3` | 已证实的可行上界（恰为 C\*） |
+  | `quantum_m3` | 共同十进制量子 `10^-D`（m³） |
+  | `grid_minimum_m3` | 候选网格最小点（= 初始库容） |
+  | `trials[]` | 逐次试算：`capacity_m3 / verdict(feasible·budget·overflow·locked·infeasible) / min_exceed_m3 / bracket_*`（试算后的区间两端） |
+
+- `feasible=false`：`infeasible.code` 取值
+  - `BUDGET_INFEASIBLE`：上界处存在不溢流序列，但最小超标 `witness.summary.total_exceed_m3` 仍高于预算；`witness` 字段为上界处的完整可行结果（可据此画见证轨迹）；
+  - `OVERFLOW_UNAVOIDABLE` / `LOCKED_INTERVAL` / `ALREADY_OVERFLOW`：上界（或初始状态）即不溢流不可行，诊断结构与 `/api/solve` 相同；
+  - `SEARCH_LIMIT`：**任一试算触限的整请求规模拒绝**——不含 `minimum_capacity_m3`/`steps`，`plan.trials` 只含已完成的试算，`plan` 带回此前严格证实的区间两端（可能为 `null`）。未完成试算绝不记作不可行。
+
+快速试用：
+
+```bash
+curl -s -X POST http://localhost:8000/api/size-capacity \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"反算示例","initial_storage_m3":2000,"dt_s":3600,"q_safe":12,
+       "min_interval":2,"initial_opening_index":1,"initial_held":0,
+       "openings":[0,3,6,9,12,16],
+       "inflows":[2,5,12,20,18,12,7,4,2,1,0,0],
+       "allowed_exceed_m3":0,"capacity_upper_m3":80000}'
+```
 
 ---
 
@@ -150,14 +221,16 @@ PYTHONPATH=. BASIN_DB_PATH=/tmp/t.db python3 -m pytest tests/ -q   # 或直接 p
 ```
 .
 ├── app/
-│   ├── main.py        FastAPI 路由、参数校验(Pydantic)、静态页面托管
-│   ├── engine.py      水量平衡 / 精确整数量子换算 / DP 搜索 / Pareto 剪枝 / 无解诊断 / 逐时段事件
+│   ├── main.py        FastAPI 路由、参数校验(Pydantic)、静态页面托管（含 /api/size-capacity）
+│   ├── engine.py      水量平衡 / 精确整数量子换算 / DP 搜索 / Pareto 剪枝 / 无解诊断 /
+│   │                  逐时段事件 / 容量反算 size_capacity（单调精确二分 + 整请求规模拒绝）
 │   ├── database.py    SQLite：scenarios、runs 两表 + 级联删除
-│   └── static/        index.html · style.css · app.js（原生，SVG 图表）
+│   └── static/        index.html · style.css · app.js（原生，SVG 图表，含容量规划入口）
 ├── tests/
-│   ├── test_engine.py # 19 组引擎用例（含 48×10 精确解回归、有损支配反例、40 组随机小规模对穷举、
-│   │                  #   高精度临界/精确边界用例、30 组高精度随机对 Fraction 精确穷举、SEARCH_LIMIT 规模拒绝）
-│   └── test_api.py    # API 端到端用例（推演/无解/规模拒绝/高精度临界/CRUD/校验）
+│   ├── test_engine.py # 引擎用例（含 48×10 精确解回归、有损支配反例、随机/高精度对穷举、
+│   │                  #   SEARCH_LIMIT 规模拒绝、容量反算阈值/分数量子/上界不可行/整请求拒绝/见证一致性）
+│   └── test_api.py    # API 端到端用例（推演/无解/规模拒绝/高精度临界/容量反算/CRUD/校验；
+│                      #   无 fastapi 时可用内置标准库 ASGI 桩件运行）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

@@ -85,16 +85,20 @@ function loadForm(p, name) {
   $("f-init-held").value = p.initial_held ?? 0;
   renderGearChips(p.openings);
   renderInflowCells(p.inflows);
+  // 容量规划默认值：预算 0、上界优先用请求中带回的值，否则取当前容量 ×1.5（用户可改）
+  $("f-allowed-exceed").value = p.allowed_exceed_m3 ?? 0;
+  $("f-cap-upper").value = p.capacity_upper_m3 != null
+    ? p.capacity_upper_m3
+    : Math.round((p.capacity_m3 || 80000) * 1.5);
 }
 
-function collectParams() {
+function collectBaseParams() {
   const err = $("form-error");
   err.hidden = true;
   const fail = (msg) => { err.textContent = msg; err.hidden = false; return null; };
 
   const name = $("f-name").value.trim() || "未命名方案";
   const dtMin = parseFloat($("f-dt-min").value);
-  const capacity = parseFloat($("f-capacity").value);
   const v0 = parseFloat($("f-v0").value);
   const qsafe = parseFloat($("f-qsafe").value);
   const minInt = parseInt($("f-min-int").value, 10);
@@ -104,9 +108,7 @@ function collectParams() {
   const inflows = readInflows();
 
   if (!(dtMin > 0)) return fail("时间步长必须为正数（分钟）。");
-  if (!(capacity > 0)) return fail("调蓄池容量必须为正数。");
   if (isNaN(v0) || v0 < 0) return fail("初始库容必须 ≥ 0。");
-  if (v0 > capacity) return fail("初始库容不能超过调蓄池容量。");
   if (isNaN(qsafe) || qsafe < 0) return fail("下游安全流量上限必须 ≥ 0。");
   if (!(minInt >= 1)) return fail("切换最小间隔必须 ≥ 1 个时段。");
   if (!(initGear >= 1)) return fail("初始档位序号必须 ≥ 1。");
@@ -119,7 +121,6 @@ function collectParams() {
 
   return {
     name,
-    capacity_m3: capacity,
     initial_storage_m3: v0,
     dt_s: dtMin * 60,
     q_safe: qsafe,
@@ -129,6 +130,30 @@ function collectParams() {
     openings,
     inflows,
   };
+}
+
+function collectParams() {
+  const base = collectBaseParams();
+  if (!base) return null;
+  const err = $("form-error");
+  const fail = (msg) => { err.textContent = msg; err.hidden = false; return null; };
+  const capacity = parseFloat($("f-capacity").value);
+  if (!(capacity > 0)) return fail("调蓄池容量必须为正数。");
+  if (base.initial_storage_m3 > capacity) return fail("初始库容不能超过调蓄池容量。");
+  return { ...base, capacity_m3: capacity };
+}
+
+function collectPlanParams() {
+  const base = collectBaseParams();
+  if (!base) return null;
+  const err = $("form-error");
+  const fail = (msg) => { err.textContent = msg; err.hidden = false; return null; };
+  const allowed = parseFloat($("f-allowed-exceed").value);
+  const capUpper = parseFloat($("f-cap-upper").value);
+  if (isNaN(allowed) || allowed < 0) return fail("允许的下游超标总量必须 ≥ 0。");
+  if (!(capUpper > 0)) return fail("设计容量上界必须为正数。");
+  if (base.initial_storage_m3 > capUpper) return fail("初始库容不能超过设计容量上界。");
+  return { ...base, allowed_exceed_m3: allowed, capacity_upper_m3: capUpper };
 }
 
 /* ---------------- 场景列表 ---------------- */
@@ -240,6 +265,23 @@ async function runSolve(persist) {
   }
 }
 
+async function runSize() {
+  const params = collectPlanParams();
+  if (!params) return;
+  const btn = $("btn-size");
+  btn.disabled = true; btn.textContent = "容量反算中…（多次精确试算）";
+  try {
+    const result = await api("POST", "/api/size-capacity", params);
+    renderResult(result);
+  } catch (e) {
+    const err = $("form-error");
+    err.textContent = e.message;
+    err.hidden = false;
+  } finally {
+    btn.disabled = false; btn.textContent = "📏 容量反算最小库容";
+  }
+}
+
 async function api(method, url, body) {
   const resp = await fetch(url, {
     method,
@@ -285,12 +327,18 @@ function renderResult(r) {
   $("placeholder").hidden = true;
   $("result").hidden = false;
 
+  // 容量反算：不可行但带见证（BUDGET_INFEASIBLE）时，图表/明细展示上界处见证，
+  // 横幅与原因仍按"不可行"渲染。
+  const witness = (!r.feasible && r.witness) ? r.witness : null;
+  const display = witness || r;
+
   const verdict = $("verdict");
-  const p = r.params || {};
+  const p = display.params || {};
+  // 预算型不可行时展示的是"上界处见证序列"，同样须通过容量/水量平衡复核
+  const witnessBad = witness ? consistencyError(witness) : null;
   if (r.feasible) {
     const s = r.summary;
-    const bad = consistencyError(r);
-    if (bad) {
+    const bad = consistencyError(r);    if (bad) {
       verdict.innerHTML = `
       <div class="verdict bad">
         <span class="v-icon">✕</span>
@@ -300,11 +348,14 @@ function renderResult(r) {
         </div>
       </div>`;
     } else {
+      const isPlan = !!r.plan;
       verdict.innerHTML = `
       <div class="verdict ok">
         <span class="v-icon">✓</span>
         <div>
-          <h2>推演可行：已求得不溢流的精确最优闸门开度序列</h2>
+          <h2>${isPlan
+            ? `容量反算完成：最小设计库容 ${fmtCap(r.plan.minimum_capacity_m3)} m³`
+            : "推演可行：已求得不溢流的精确最优闸门开度序列"}</h2>
           <p>共 ${p.steps_count} 个时段，闸门切换 ${s.switches} 次；
           库容峰值 ${fmtInt(s.max_storage_m3)} m³（利用率 ${(s.max_storage_utilization * 100).toFixed(1)}%），
           下游超标 ${s.exceed_steps} 个时段、超标总量 <b>${fmt1(s.total_exceed_m3)} m³</b>。<br>
@@ -315,6 +366,17 @@ function renderResult(r) {
   } else {
     const inf = r.infeasible;
     const rejected = inf.code === "SEARCH_LIMIT";
+    if (witnessBad) {
+      verdict.innerHTML = `
+      <div class="verdict bad">
+        <span class="v-icon">✕</span>
+        <div>
+          <h2>见证序列未通过容量/水量平衡一致性校验，不予展示</h2>
+          <p>${escapeHtml(witnessBad)}。该结果不可采用，请将其作为异常上报；原始不可行原因：
+          <code>${escapeHtml(inf.code)}</code>。</p>
+        </div>
+      </div>`;
+    } else {
     const title = rejected
       ? "规模拒绝：未返回任何结果（既非无解，也非近似最优）"
       : inf.title;
@@ -326,13 +388,23 @@ function renderResult(r) {
           <p>类型：<code>${inf.code}</code>${inf.at_step != null ? `　首次问题时段：第 ${inf.at_step + 1} 时段` : ""}</p>
         </div>
       </div>`;
+    }
   }
 
-  renderChips(r);
-  if (r.feasible) {
-    renderCharts(r);
-    renderTable(r);
-    $("infeasible").innerHTML = "";
+  renderPlanCard(r);
+  renderChips(display);
+  if ((display.feasible || display.steps) && !witnessBad) {
+    // BUDGET_INFEASIBLE：见证图表以见证容量（设计上界）画容量线
+    renderCharts(display);
+    renderTable(display);
+    if (witness) {
+      renderInfeasible(r);
+      $("charts").insertAdjacentHTML(
+        "afterbegin",
+        `<div class="chart-title witness-note">下列库容/出流过程与明细为「设计容量上界 ${fmtCap(p.capacity_m3)} m³ 处的见证序列」（最小可达超标 ${fmt1(witness.summary.total_exceed_m3)} m³，仍高于预算，故该上界不满足预算）。</div>`);
+    } else {
+      $("infeasible").innerHTML = "";
+    }
   } else {
     $("charts").innerHTML = "";
     $("table-wrap").innerHTML = "";
@@ -341,8 +413,10 @@ function renderResult(r) {
   $("engine-detail").hidden = false;
   $("engine-stats").textContent = JSON.stringify(
     r.feasible
-      ? { objective: r.objective, prune_stats: r.prune_stats }
-      : { prune_stats: r.prune_stats || "（见无解说明中的剪枝次数）" },
+      ? { objective: r.objective, prune_stats: r.prune_stats,
+          ...(r.plan ? { plan: planStats(r.plan) } : {}) }
+      : { prune_stats: r.prune_stats || "（见无解说明中的剪枝次数）",
+          ...(r.plan ? { plan: planStats(r.plan) } : {}) },
     null, 2
   );
 }
@@ -392,6 +466,141 @@ function renderInfeasible(r) {
       <h4>${rejected ? "如何让规模落入精确求解范围" : "可行化建议"}</h4>
       <ol>${sug}</ol>
     </div>${extra}`;
+}
+
+/* ---------------- 容量规划（容量反算）卡片 ---------------- */
+
+/* 容量可能落在 1e-6 m³ 量子上：整数用千分位，小数保留必要精度（最多 6 位）。 */
+function fmtCap(x) {
+  if (x == null || isNaN(x)) return "—";
+  const s = x.toLocaleString("en-US", { maximumFractionDigits: 6, minimumFractionDigits: 0 });
+  return s;
+}
+
+function planStats(pl) {
+  return {
+    minimum_capacity_m3: pl.minimum_capacity_m3,
+    infeasible_below_m3: pl.infeasible_below_m3,
+    feasible_at_or_above_m3: pl.feasible_at_or_above_m3,
+    quantum_m3: pl.quantum_m3,
+    grid_minimum_m3: pl.grid_minimum_m3,
+    allowed_exceed_m3: pl.allowed_exceed_m3,
+    capacity_upper_m3: pl.capacity_upper_m3,
+    trials_count: pl.trials_count,
+  };
+}
+
+function renderPlanCard(r) {
+  const box = $("plan-card");
+  const pl = r.plan;
+  if (!pl) { box.innerHTML = ""; return; }
+  const rejected = !r.feasible && r.infeasible && r.infeasible.code === "SEARCH_LIMIT";
+  const found = pl.minimum_capacity_m3 != null;
+
+  const head = found
+    ? `<h3>容量反算结果：最小设计库容 <b>${fmtCap(pl.minimum_capacity_m3)}</b> m³
+        <span class="plan-tag ok">已证实最小</span></h3>
+       <p class="plan-sub">超标预算 ${fmtCap(pl.allowed_exceed_m3)} m³、设计容量上界
+        ${fmtCap(pl.capacity_upper_m3)} m³ 下，全程不溢流的最小可取容量。
+        下方见证序列即按该容量推演所得（沿用 超标总量→切换次数→峰值出流→峰值库容 的既有目标）。</p>`
+    : `<h3>容量反算${rejected ? "中止" : "未求得最小库容"}
+        <span class="plan-tag ${rejected ? "warn" : "bad"}">${rejected ? "规模拒绝" : "不可行"}</span></h3>
+       <p class="plan-sub">搜索区间中已被精确证实的部分仍列于下方；${rejected
+          ? "某次试算触发资源保护上限、真值未知，未完成的试算没有被当作不可行，区间不再继续收缩。"
+          : "设计容量上界处即已不可行，原因见上方横幅与建议。"}</p>`;
+
+  const kpis = [
+    ["最小设计库容", found ? fmtCap(pl.minimum_capacity_m3) : "—", "m³", found ? "ok" : ""],
+    ["已证不可行下界", pl.infeasible_below_m3 == null ? "—" : fmtCap(pl.infeasible_below_m3),
+     "m³（该容量及以下不可行）", "danger"],
+    ["已证可行上界", pl.feasible_at_or_above_m3 == null ? "—" : fmtCap(pl.feasible_at_or_above_m3),
+     "m³（该容量起可行）", "ok"],
+    ["容量量子", fmtCap(pl.quantum_m3), "m³/格", ""],
+  ].map(([l, v, u, c]) => kpi(l, v, u, c)).join("");
+
+  const bar = planBracketBar(pl, found);
+  const log = planTrialTable(pl);
+  const note = pl.infeasible_low_note
+    ? `<p class="plan-note">注：${escapeHtml(pl.infeasible_low_note)}</p>` : "";
+
+  box.innerHTML = `
+    <div class="plan-card">
+      ${head}
+      <div class="chips">${kpis}</div>
+      ${bar}
+      ${log}
+      ${note}
+    </div>`;
+}
+
+function planBracketBar(pl, found) {
+  const lo = pl.grid_minimum_m3;
+  const hi = pl.capacity_upper_m3;
+  const span = Math.max(hi - lo, 0);
+  const pct = (v) => (span > 0 ? Math.min(100, Math.max(0, ((v - lo) / span) * 100)) : 0);
+  const cStar = pl.minimum_capacity_m3;
+  const provenLo = pl.infeasible_below_m3;
+  const provenHi = pl.feasible_at_or_above_m3;
+
+  // 已证不可行段：[网格最小点, provenLo]；已证可行段起点：provenHi
+  let segs = "";
+  if (provenLo != null && provenLo >= lo) {
+    segs += `<div class="seg seg-bad" style="left:0%;width:${pct(provenLo)}%"></div>`;
+  }
+  if (provenHi != null && provenHi <= hi) {
+    segs += `<div class="seg seg-ok" style="left:${pct(provenHi)}%;width:${100 - pct(provenHi)}%"></div>`;
+  }
+  const marks = [];
+  const mark = (v, cls, label) =>
+    `<div class="bmark ${cls}" style="left:${pct(v)}%"><span>${label}</span></div>`;
+  marks.push(mark(lo, "m-lo", `网格最小点 ${fmtCap(lo)}`));
+  if (provenLo != null) marks.push(mark(provenLo, "m-bad", `不可行 ≤ ${fmtCap(provenLo)}`));
+  if (found && cStar != null) marks.push(mark(cStar, "m-star", `C* = ${fmtCap(cStar)}`));
+  if (provenHi != null && (!found || provenHi !== cStar))
+    marks.push(mark(provenHi, "m-ok", `可行 ≥ ${fmtCap(provenHi)}`));
+  marks.push(mark(hi, "m-hi", `上界 ${fmtCap(hi)}`));
+
+  return `<div class="bracket-block">
+    <div class="chart-title">搜索区间（容量轴，单位 m³）</div>
+    <div class="bracket-bar">${segs}${marks.join("")}</div>
+    <div class="bracket-legend">
+      <span><i class="lg-bad"></i>已精确证实不可行</span>
+      <span><i class="lg-ok"></i>已精确证实可行</span>
+      <span><i class="lg-unknown"></i>未判定</span>
+    </div>
+  </div>`;
+}
+
+function planTrialTable(pl) {
+  if (!pl.trials || !pl.trials.length) {
+    return `<div class="chart-title" style="margin-top:10px">试算日志：无完成试算</div>`;
+  }
+  const rows = pl.trials.map((t, i) => {
+    const ok = t.verdict === "feasible";
+    const cls = ok ? "ok" : (t.verdict === "budget" ? "warn" : "bad");
+    const txt = { feasible: "可行", budget: "超预算", infeasible: "溢流/锁定",
+                  overflow: "满管仍溢流", locked: "切换锁定无解" }[t.verdict] || t.verdict;
+    return `<tr>
+      <td class="t">${i + 1}</td>
+      <td>${fmtCap(t.capacity_m3)}</td>
+      <td><span class="tv tv-${cls}">${txt}</span></td>
+      <td>${t.min_exceed_m3 == null ? "—" : fmtCap(t.min_exceed_m3)}</td>
+      <td>${t.bracket_infeasible_below_m3 == null ? "—" : fmtCap(t.bracket_infeasible_below_m3)}</td>
+      <td>${t.bracket_feasible_at_or_above_m3 == null ? "—" : fmtCap(t.bracket_feasible_at_or_above_m3)}</td>
+    </tr>`;
+  }).join("");
+  return `<details class="plan-trials" open>
+    <summary>试算日志（共 ${pl.trials_count} 次精确试算）</summary>
+    <div class="table-wrap">
+      <table class="steps plan-log">
+        <thead><tr>
+          <th class="t">#</th><th>试算容量 (m³)</th><th>判定</th>
+          <th>最小超标 (m³)</th><th>试算后不可行下界 (m³)</th><th>试算后可行上界 (m³)</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+  </details>`;
 }
 
 function renderTable(r) {
@@ -564,6 +773,7 @@ $("btn-del-inflow").onclick = () => {
   if (cur.length > 1) { cur.pop(); renderInflowCells(cur); }
 };
 $("btn-solve").onclick = () => runSolve(false);
+$("btn-size").onclick = () => runSize();
 $("btn-save").onclick = async () => {
   const params = collectParams();
   if (!params) return;

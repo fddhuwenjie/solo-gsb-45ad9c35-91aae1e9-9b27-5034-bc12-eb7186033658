@@ -18,9 +18,9 @@ app = FastAPI(title="城市雨洪调蓄池泄放序列推演台", version="1.0")
 
 # ---------------- Schemas ----------------
 
-class ScenarioInput(BaseModel):
+class _ScenarioBase(BaseModel):
+    """推演/容量反算共用的方案输入（不含设计容量；容量由各子模型补充）。"""
     name: str = Field(min_length=1, max_length=80, description="方案名称")
-    capacity_m3: float = Field(gt=0, description="调蓄池容量 (m³)")
     initial_storage_m3: float = Field(ge=0, description="初始库容 (m³)")
     dt_s: float = Field(gt=0, description="时间步长 (秒)")
     q_safe: float = Field(ge=0, description="下游安全流量上限 (m³/s)")
@@ -50,11 +50,9 @@ class ScenarioInput(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _check_consistency(self):
+    def _check_gear_range(self):
         if not (1 <= self.initial_opening_index <= len(self.openings)):
             raise ValueError("初始档位序号超出闸门档位数")
-        if self.initial_storage_m3 > self.capacity_m3:
-            raise ValueError("初始库容不能超过调蓄池容量")
         return self
 
     def normalized(self) -> dict:
@@ -64,12 +62,36 @@ class ScenarioInput(BaseModel):
         return data
 
 
+class ScenarioInput(_ScenarioBase):
+    capacity_m3: float = Field(gt=0, description="调蓄池容量 (m³)")
+
+    @model_validator(mode="after")
+    def _check_consistency(self):
+        if self.initial_storage_m3 > self.capacity_m3:
+            raise ValueError("初始库容不能超过调蓄池容量")
+        return self
+
+
 class ScenarioCreate(ScenarioInput):
     pass
 
 
 class ScenarioUpdate(ScenarioInput):
     pass
+
+
+class CapacityPlanInput(_ScenarioBase):
+    """容量反算输入：沿用入流/档位/间隔/初始状态，另填超标预算与容量上界。"""
+    allowed_exceed_m3: float = Field(
+        ge=0, description="允许的下游安全流量超标总量 (m³)，反算的超标预算")
+    capacity_upper_m3: float = Field(
+        gt=0, description="设计容量上界 (m³)，反算二分的最大候选")
+
+    @model_validator(mode="after")
+    def _check_plan_consistency(self):
+        if self.initial_storage_m3 > self.capacity_upper_m3:
+            raise ValueError("初始库容不能超过设计容量上界")
+        return self
 
 
 # ---------------- API ----------------
@@ -83,6 +105,13 @@ def health():
 def solve_adhoc(payload: ScenarioInput):
     """不入库，直接按当前表单参数推演（"立即推演"按钮使用）。"""
     return engine.solve(payload.normalized())
+
+
+@app.post("/api/size-capacity")
+def size_capacity_api(payload: CapacityPlanInput):
+    """容量反算：在输入共同十进制量子网格上求满足超标预算且全程不溢流的
+    最小设计库容，并返回 C* 上的见证序列与已证实的搜索区间（不入库）。"""
+    return engine.size_capacity(payload.normalized())
 
 
 @app.get("/api/scenarios")
